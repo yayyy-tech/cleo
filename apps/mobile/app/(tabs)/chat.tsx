@@ -1,7 +1,39 @@
 import { View, Text, TouchableOpacity } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
+import { useEffect } from 'react'
+import AsyncStorage from '@react-native-async-storage/async-storage'
+import { PermissionsAndroid, Platform } from 'react-native'
+import { syncSMSHistory } from '../../src/services/smsSync'
 
 export default function ChatScreen() {
+  useEffect(() => {
+    const maybeSyncSms = async () => {
+      if (Platform.OS !== 'android') return
+
+      const perm = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_SMS)
+      if (!perm) return
+
+      const key = 'dime:lastSmsSync'
+      const last = await AsyncStorage.getItem(key)
+      const now = Date.now()
+
+      if (last) {
+        const lastTs = Number(last)
+        const diffMs = now - lastTs
+        if (diffMs < 60 * 60 * 1000) {
+          return
+        }
+        const daysBack = Math.max(1, Math.ceil(diffMs / (24 * 60 * 60 * 1000)))
+        await syncSMSHistory(daysBack)
+      } else {
+        await syncSMSHistory(30)
+      }
+
+      await AsyncStorage.setItem(key, String(now))
+    }
+
+    void maybeSyncSms()
+  }, [])
   return (
     <SafeAreaView className="flex-1 bg-dime-navy" edges={['top']}>
       {/* Header */}

@@ -15,26 +15,29 @@ export default function Step3() {
   const pickAndUpload = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
-  type: [
-    'application/pdf',
-    'application/vnd.ms-excel',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    '*/*'
-  ],
-  copyToCacheDirectory: true,
-})
-
+        type: [
+          'application/pdf',
+          'application/vnd.ms-excel',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'text/csv',
+          '*/*',
+        ],
+        copyToCacheDirectory: true,
+      })
       if (result.canceled) return
 
       const file = result.assets[0]
       setUploading(true)
 
       const formData = new FormData()
-      formData.append('file', {
-  uri: file.uri,
-  name: file.name,
-  type: file.mimeType || 'application/octet-stream',
-} as any)
+      formData.append(
+        'file',
+        {
+          uri: file.uri,
+          name: file.name,
+          type: file.mimeType || 'application/octet-stream',
+        } as any
+      )
 
       const { data } = await api.post('/transactions/upload-csv', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -64,14 +67,14 @@ export default function Step3() {
             Connect your bank
           </Text>
           <Text className="text-dime-muted" style={{ fontSize: 15, lineHeight: 22 }}>
-            Download your bank statement as CSV and upload it here. Dime will analyze your spending instantly.
+            Download your bank statement as PDF, Excel or CSV and upload it here. Dime will analyze your spending instantly.
           </Text>
         </View>
 
         {/* How to get CSV */}
         <View className="bg-dime-card border border-dime-border rounded-2xl p-4 gap-3">
           <Text className="text-dime-text font-semibold" style={{ fontSize: 15 }}>
-            How to get your bank statement CSV
+            How to get your bank statement (PDF, Excel or CSV)
           </Text>
           {[
             { bank: 'HDFC', steps: 'NetBanking → Accounts → Statement → Download Excel/PDF' },

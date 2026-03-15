@@ -15,10 +15,24 @@ export default function WalletScreen() {
   const [summary, setSummary] = useState<any>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [activeFilter, setActiveFilter] = useState('all')
+  const [smsSyncing, setSmsSyncing] = useState(false)
+  const [lastSmsSync, setLastSmsSync] = useState<Date | null>(null)
 
   useEffect(() => {
     fetchTransactions()
     fetchSummary()
+    // Load last SMS sync time if stored
+    ;(async () => {
+      try {
+        const value = await AsyncStorage.getItem('dime:lastSmsSync')
+        if (value) {
+          const ts = Number(value)
+          if (!Number.isNaN(ts)) setLastSmsSync(new Date(ts))
+        }
+      } catch {
+        // ignore
+      }
+    })()
   }, [])
 
   const fetchSummary = async () => {
@@ -40,7 +54,13 @@ export default function WalletScreen() {
   const uploadCSV = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['text/csv', 'text/comma-separated-values', 'application/pdf', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '*/*'],
+        type: [
+          'application/pdf',
+          'application/vnd.ms-excel',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'text/csv',
+          '*/*',
+        ],
         copyToCacheDirectory: true,
       })
       if (result.canceled) return
@@ -49,7 +69,14 @@ export default function WalletScreen() {
       setUploading(true)
 
       const formData = new FormData()
-      formData.append('file', { uri: file.uri, name: file.name, type: 'text/csv' } as any)
+      formData.append(
+        'file',
+        {
+          uri: file.uri,
+          name: file.name,
+          type: file.mimeType || 'application/octet-stream',
+        } as any
+      )
 
       const { data } = await api.post('/transactions/upload-csv', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -61,7 +88,7 @@ export default function WalletScreen() {
       fetchSummary()
     } catch (e) {
       setUploading(false)
-      Alert.alert('Error', 'Upload failed. Make sure it is a valid bank statement CSV.')
+      Alert.alert('Error', 'Upload failed. Make sure it is a valid bank statement PDF, Excel or CSV.')
     }
   }
 
@@ -102,10 +129,40 @@ export default function WalletScreen() {
               : <Text style={{ fontSize: 14 }}>📂</Text>
             }
             <Text style={{ color: 'white', fontSize: 13, fontWeight: '500' }}>
-              {uploading ? 'Uploading...' : 'Import CSV'}
+              {uploading ? 'Uploading...' : 'Import PDF, Excel or CSV'}
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* SMS sync banner */}
+        {smsSyncing && (
+          <View
+            style={{
+              marginHorizontal: 16,
+              marginBottom: 8,
+              paddingVertical: 6,
+              paddingHorizontal: 10,
+              borderRadius: 999,
+              backgroundColor: COLORS.bgCard,
+              borderWidth: 1,
+              borderColor: COLORS.border,
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <Text style={{ fontSize: 14 }}>🔄</Text>
+            <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+              Syncing transactions from SMS...
+            </Text>
+            {lastSmsSync && (
+              <Text style={{ color: COLORS.textSecondary, fontSize: 11, marginLeft: 'auto' }}>
+                Last updated:{' '}
+                {Math.max(1, Math.round((Date.now() - lastSmsSync.getTime()) / 60000))} mins ago
+              </Text>
+            )}
+          </View>
+        )}
 
         {transactions.length === 0 ? (
           <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 64, paddingHorizontal: 32, gap: 16 }}>
@@ -114,7 +171,7 @@ export default function WalletScreen() {
               No transactions yet
             </Text>
             <Text style={{ color: COLORS.textMuted, fontSize: 14, lineHeight: 20, textAlign: 'center' }}>
-              Import your bank statement CSV to see your spending breakdown
+              Import your bank statement PDF, Excel or CSV to see your spending breakdown
             </Text>
             <TouchableOpacity
               onPress={uploadCSV}
@@ -213,9 +270,31 @@ export default function WalletScreen() {
                     <Text style={{ color: COLORS.textPrimary, fontSize: 14, fontWeight: '500' }} numberOfLines={1}>
                       {txn.merchantName || txn.rawDescription}
                     </Text>
-                    <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-                      {txn.category || 'Uncategorized'} · {new Date(txn.transactionDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
-                    </Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+                        {txn.category || 'Uncategorized'} ·{' '}
+                        {new Date(txn.transactionDate).toLocaleDateString('en-IN', {
+                          day: 'numeric',
+                          month: 'short',
+                        })}
+                      </Text>
+                      {txn.source === 'SMS' && (
+                        <View
+                          style={{
+                            paddingHorizontal: 6,
+                            paddingVertical: 2,
+                            borderRadius: 999,
+                            backgroundColor: COLORS.bgElevated,
+                            borderWidth: 1,
+                            borderColor: COLORS.borderLight,
+                          }}
+                        >
+                          <Text style={{ color: COLORS.textSecondary, fontSize: 10, fontWeight: '600' }}>
+                            SMS
+                          </Text>
+                        </View>
+                      )}
+                    </View>
                   </View>
                   <Text style={{ fontSize: 15, fontWeight: '600', color: txn.transactionType === 'CREDIT' ? COLORS.green : COLORS.textPrimary }}>
                     {txn.transactionType === 'CREDIT' ? '+' : '-'}{formatAmount(Math.abs(txn.amount))}

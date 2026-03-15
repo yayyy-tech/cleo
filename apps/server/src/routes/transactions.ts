@@ -1,12 +1,27 @@
 import { Router, Request, Response } from "express";
-import { authenticateUser } from "../middleware/auth";
-import { supabaseAdmin } from "../db/supabase";
 import multer from "multer";
 import { parse } from "csv-parse/sync";
+import * as XLSX from "xlsx";
+import pdfParse from "pdf-parse";
+import { authenticateUser } from "../middleware/auth";
+import { supabaseAdmin } from "../db/supabase";
+import { Database } from "../db/types";
+
+type TransactionInsert = Database["public"]["Tables"]["transactions"]["Insert"];
+type TransactionRowShape = {
+  date: string;
+  description: string;
+  debit: number | null;
+  credit: number | null;
+  reference: string | null;
+};
 
 const router = Router();
 const paramId = (req: Request) => req.params.id as string;
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
 
 // GET /api/v1/transactions
 router.get("/", authenticateUser, async (req: Request, res: Response) => {
@@ -151,83 +166,146 @@ router.get("/summary", authenticateUser, async (req: Request, res: Response) => 
 
 // POST /api/v1/transactions/upload-csv
 router.post(
-  import * as XLSX from 'xlsx'
-import pdfParse from 'pdf-parse'
+  "/upload-csv",
+  authenticateUser,
+  upload.single("file"),
+  async (req: Request, res: Response) => {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: "No file uploaded" });
+        return;
+      }
 
-// Inside the upload route handler:
-router.post('/upload-csv', authenticateUser, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
+      const userId = req.user!.userId;
+      const accountId = (req.body.account_id as string | undefined) || null;
+      const fileBuffer = req.file.buffer;
+      const fileName = req.file.originalname.toLowerCase();
+      const mimeType = req.file.mimetype || "";
 
-    const { userId } = req.user!
-    const fileBuffer = req.file.buffer
-    const fileName = req.file.originalname.toLowerCase()
-    const mimeType = req.file.mimetype
+      let rawRows: Record<string, string>[] = [];
 
-    let rows: any[] = []
+      // Excel: .xlsx / .xls
+      if (
+        fileName.endsWith(".xlsx") ||
+        fileName.endsWith(".xls") ||
+        mimeType.includes("spreadsheet") ||
+        mimeType.includes("excel")
+      ) {
+        const workbook = XLSX.read(fileBuffer, { type: "buffer", cellDates: true });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "" }) as Record<string, string>[];
+      }
+      // PDF
+      else if (fileName.endsWith(".pdf") || mimeType.includes("pdf")) {
+        const pdfData = (await (pdfParse as any)(fileBuffer)) as { text: string };
+        const lines = pdfData.text
+          .split("\n")
+          .map((l: string) => l.trim())
+          .filter((l: string) => l.length > 0);
+        rawRows = parsePDFLines(lines);
+      }
+      // CSV (default)
+      else {
+        const text = fileBuffer.toString("utf-8");
+        rawRows = parseCSVText(text);
+      }
 
-    // ── EXCEL (.xls / .xlsx) ──────────────────────────────
-    if (
-      fileName.endsWith('.xlsx') ||
-      fileName.endsWith('.xls') ||
-      mimeType.includes('spreadsheet') ||
-      mimeType.includes('excel')
-    ) {
-      const workbook = XLSX.read(fileBuffer, { type: 'buffer', cellDates: true })
-      const sheetName = workbook.SheetNames[0]
-      const sheet = workbook.Sheets[sheetName]
-      rows = XLSX.utils.sheet_to_json(sheet, { defval: '' })
+      const normalizedRows: TransactionRowShape[] = rawRows
+        .map((row) => normalizeRow(row))
+        .filter((r): r is TransactionRowShape => r !== null);
+
+      const parsed = normalizedRows
+        .map((r): { date: string; amount: number; description: string; referenceId?: string } | null => {
+          const credit = r.credit ?? 0;
+          const debit = r.debit ?? 0;
+          const amount = credit > 0 ? credit : debit > 0 ? -debit : 0;
+          if (amount === 0) return null;
+          return {
+            date: r.date,
+            amount,
+            description: r.description,
+            referenceId: r.reference ?? undefined,
+          };
+        })
+        .filter(
+          (r): r is { date: string; amount: number; description: string; referenceId?: string } =>
+            r !== null
+        );
+
+      if (parsed.length === 0) {
+        res.json({ imported: 0, skipped: 0, errors: ["No valid transactions found"] });
+        return;
+      }
+
+      const { data: existing, error: existingError } = await supabaseAdmin
+        .from("transactions")
+        .select("id, transaction_date, amount, description")
+        .eq("user_id", userId)
+        .gte("transaction_date", parsed[parsed.length - 1].date)
+        .lte("transaction_date", parsed[0].date);
+
+      if (existingError) {
+        res.status(400).json({ error: existingError.message });
+        return;
+      }
+
+      const existingSet = new Set(
+        (existing || []).map(
+          (t) => `${t.transaction_date}::${t.amount}::${t.description.toLowerCase()}`
+        )
+      );
+
+      const toInsert: TransactionInsert[] = [];
+      let imported = 0;
+      let skipped = 0;
+
+      for (const row of parsed) {
+        const key = `${row.date}::${row.amount}::${row.description.toLowerCase()}`;
+        if (existingSet.has(key)) {
+          skipped += 1;
+          continue;
+        }
+
+        const insert: TransactionInsert = {
+          user_id: userId,
+          account_id: accountId,
+          amount: row.amount,
+          currency: "INR",
+          description: row.description,
+          transaction_date: row.date,
+          reference_id: row.referenceId || null,
+          mode: "OTHER",
+          is_recurring: false,
+          is_income: row.amount > 0,
+          is_salary: false,
+          is_emi: false,
+          enriched: false,
+          enrichment_source: "pending",
+        };
+
+        toInsert.push(insert);
+        imported += 1;
+      }
+
+      if (toInsert.length > 0) {
+        const { error: insertError } = await supabaseAdmin
+          .from("transactions")
+          .insert(toInsert);
+
+        if (insertError) {
+          res.status(400).json({ error: insertError.message });
+          return;
+        }
+      }
+
+      res.json({ imported, skipped });
+    } catch (err) {
+      console.error("Failed to process statement upload", err);
+      res.status(500).json({ error: "Failed to process file" });
     }
-
-    // ── PDF ───────────────────────────────────────────────
-    else if (fileName.endsWith('.pdf') || mimeType.includes('pdf')) {
-      const pdfData = await pdfParse(fileBuffer)
-      const lines = pdfData.text.split('\n').filter((l: string) => l.trim())
-      // Convert PDF lines to row objects
-      rows = parsePDFLines(lines)
-    }
-
-    // ── CSV (fallback) ────────────────────────────────────
-    else {
-      const text = fileBuffer.toString('utf-8')
-      rows = await parseCSVText(text)
-    }
-
-    // Normalize and insert transactions
-    const results = await processRows(rows, userId, req.body.account_id)
-
-    res.json({
-      imported: results.imported,
-      skipped: results.skipped,
-      errors: results.errors
-    })
-
-  } catch (err: any) {
-    console.error('Upload error:', err)
-    res.status(500).json({ error: 'Failed to process file', details: err.message })
   }
-})
-
-// PDF line parser — handles common Indian bank PDF statement formats
-function parsePDFLines(lines: string[]): any[] {
-  const rows: any[] = []
-  // Pattern: date, description, debit, credit, balance
-  const datePattern = /(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/
-  
-  for (const line of lines) {
-    if (!datePattern.test(line)) continue
-    const parts = line.trim().split(/\s{2,}|\t/)
-    if (parts.length < 3) continue
-    rows.push({
-      Date: parts[0],
-      Description: parts[1],
-      Debit: parts[2],
-      Credit: parts[3] || '',
-      Balance: parts[4] || ''
-    })
-  }
-  return rows
-}
+);
 
 // PATCH /api/v1/transactions/:id
 router.patch("/:id", authenticateUser, async (req: Request, res: Response) => {
@@ -267,10 +345,209 @@ router.patch("/:id", authenticateUser, async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/v1/transactions/sync-sms
+router.post(
+  "/sync-sms",
+  authenticateUser,
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.user!.userId;
+      const body = req.body as {
+        transactions?: Array<{
+          amount: number;
+          type: "DEBIT" | "CREDIT";
+          account: string | null;
+          upiId: string | null;
+          merchantName: string | null;
+          date: string | Date;
+          balance: number | null;
+          bank: string | null;
+          rawSMS: string;
+        }>;
+      };
+
+      const txns = body.transactions || [];
+      if (txns.length === 0) {
+        res.json({ synced: 0, skipped: 0 });
+        return;
+      }
+
+      const firstDate = new Date(
+        txns.reduce(
+          (min, t) => Math.min(min, new Date(t.date).getTime()),
+          Date.now()
+        )
+      ).toISOString();
+      const lastDate = new Date(
+        txns.reduce(
+          (max, t) => Math.max(max, new Date(t.date).getTime()),
+          0
+        )
+      ).toISOString();
+
+      const { data: existing, error: existingError } = await supabaseAdmin
+        .from("transactions")
+        .select("id, transaction_date, amount, description, reference_id")
+        .eq("user_id", userId)
+        .gte("transaction_date", firstDate)
+        .lte("transaction_date", lastDate);
+
+      if (existingError) {
+        res.status(400).json({ error: existingError.message });
+        return;
+      }
+
+      const existingSet = new Set(
+        (existing || []).map(
+          (t) =>
+            `${t.transaction_date}::${t.amount}::${(t.reference_id || "").toLowerCase()}`
+        )
+      );
+
+      const inserts: TransactionInsert[] = [];
+      let synced = 0;
+      let skipped = 0;
+
+      for (const t of txns) {
+        const dt = new Date(t.date);
+        const iso = dt.toISOString();
+        const amount = t.type === "CREDIT" ? Math.abs(t.amount) : -Math.abs(t.amount);
+        const refKey = (t.account || "").toLowerCase();
+        const dupKey = `${iso}::${amount}::${refKey}`;
+
+        if (existingSet.has(dupKey)) {
+          skipped += 1;
+          continue;
+        }
+
+        const insert: TransactionInsert = {
+          user_id: userId,
+          account_id: null,
+          amount,
+          currency: "INR",
+          description: t.rawSMS.slice(0, 500),
+          merchant_name: t.merchantName,
+          transaction_date: iso,
+          reference_id: refKey || null,
+          mode: t.upiId ? "UPI" : "OTHER",
+          is_recurring: false,
+          is_income: amount > 0,
+          is_salary: false,
+          is_emi: false,
+          enriched: false,
+          enrichment_source: "pending",
+          notes: null,
+        };
+
+        inserts.push(insert);
+        synced += 1;
+      }
+
+      if (inserts.length > 0) {
+        const { error: insertError } = await supabaseAdmin
+          .from("transactions")
+          .insert(inserts);
+        if (insertError) {
+          res.status(400).json({ error: insertError.message });
+          return;
+        }
+      }
+
+      res.json({ synced, skipped });
+    } catch (err) {
+      console.error("Failed to sync SMS transactions", err);
+      res.status(500).json({ error: "Failed to sync SMS transactions" });
+    }
+  }
+);
+
 // --- Helpers ---
 
 function formatMonthYear(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// Parse CSV text into row objects (header-based)
+function parseCSVText(text: string): Record<string, string>[] {
+  if (!text.trim()) return [];
+  return parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+  }) as Record<string, string>[];
+}
+
+function normalizeRow(row: Record<string, string>): TransactionRowShape | null {
+  const parsed = parseCSVRow(row);
+  if (!parsed) return null;
+
+  const debit = parsed.amount < 0 ? Math.abs(parsed.amount) : 0;
+  const credit = parsed.amount > 0 ? parsed.amount : 0;
+
+  return {
+    date: parsed.date,
+    description: parsed.description,
+    debit: debit || null,
+    credit: credit || null,
+    reference: parsed.referenceId ?? null,
+  };
+}
+
+// PDF line parser — detect transaction rows from text lines
+function parsePDFLines(lines: string[]): Record<string, string>[] {
+  const rows: Record<string, string>[] = [];
+
+  const datePattern = /\b(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}|\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{4})\b/i;
+  const amountPattern = /([₹]?\s*\d[\d,]*\.?\d*)/;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (!datePattern.test(trimmed)) continue;
+    if (!amountPattern.test(trimmed)) continue;
+
+    const parts = trimmed.split(/\s{2,}|\t/).filter((p) => p.trim().length > 0);
+    if (parts.length < 2) continue;
+
+    const dateMatch = trimmed.match(datePattern);
+    const dateStr = dateMatch ? dateMatch[1] : parts[0];
+
+    let description = trimmed.replace(datePattern, "").trim();
+
+    let debit = "";
+    let credit = "";
+
+    const debitRegex = /(debit|dr)[^0-9₹]*([₹]?\s*\d[\d,]*\.?\d*)/i;
+    const creditRegex = /(credit|cr)[^0-9₹]*([₹]?\s*\d[\d,]*\.?\d*)/i;
+
+    const debitMatch = trimmed.match(debitRegex);
+    const creditMatch = trimmed.match(creditRegex);
+
+    if (debitMatch && debitMatch[2]) {
+      debit = debitMatch[2];
+    }
+    if (creditMatch && creditMatch[2]) {
+      credit = creditMatch[2];
+    }
+
+    if (!debit && !credit) {
+      const amtMatch = trimmed.match(amountPattern);
+      if (amtMatch && amtMatch[1]) {
+        debit = amtMatch[1];
+      }
+    }
+
+    rows.push({
+      Date: dateStr,
+      Description: description,
+      Debit: debit,
+      Credit: credit,
+      Reference: "",
+    });
+  }
+
+  return rows;
 }
 
 // Map common Indian bank CSV column names to our fields

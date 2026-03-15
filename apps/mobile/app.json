@@ -29,7 +29,9 @@
         "INTERNET",
         "VIBRATE",
         "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "READ_SMS",
+        "RECEIVE_SMS"
       ]
     },
     "plugins": [
